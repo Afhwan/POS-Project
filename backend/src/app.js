@@ -1,3 +1,5 @@
+//inti aplikasi  inti express. disini pasang semua middleware dan route dasar
+
 const express = require('express');
 const session = require('express-session');
 const helmet = require('helmet');
@@ -48,7 +50,7 @@ app.get('/api/v1/health', (req, res) => {
 // ============ ERROR HANDLER (sementara) ============
 // Nanti kita akan buat lebih lengkap
 app.use((err, req, res, next) => {
-  console.error('❌ Error:', err.message);
+  console.error('Error:', err.message);
   res.status(500).json({
     success: false,
     message: 'Internal server error',
