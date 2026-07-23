@@ -153,8 +153,8 @@ app.post('/api/v1/auth/login', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Internal server error',
-      debug: error.message, // <-- INI AKAN MENUNJUKKAN PENYEBAB ERROR
-      stack: error.stack,   // <-- LIHAT STACK TRACE-NYA
+      debug: error.message,
+      stack: error.stack,
     });
   }
 });
@@ -851,7 +851,7 @@ app.get('/api/v1/orders/:id', requireAuth, async (req, res) => {
 app.patch('/api/v1/orders/:id/status', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const { status, payment_method, payment_amount } = req.body;
     const allowedStatus = ['PENDING', 'PAID', 'COMPLETED', 'CANCELLED'];
     if (!status || !allowedStatus.includes(status.toUpperCase())) {
       return res.status(400).json({ success: false, message: 'Invalid status. Allowed: PENDING, PAID, COMPLETED, CANCELLED' });
@@ -892,34 +892,49 @@ app.patch('/api/v1/orders/:id/status', requireAuth, async (req, res) => {
     const result = await pool.query(query, values);
 
     // ============================================================
-    // 🆕 KODE BARU: LOGIKA STOK OTOMATIS (TAMBAHKAN DI SINI)
+    // LOGIKA STOK OTOMATIS & PEMBUATAN TRANSACTION / PAYMENT
     // ============================================================
-    // === TAMBAHKAN DI DALAM try setelah update status ===
-if (newStatus === 'PAID') {
-    // Buat client transaksi baru untuk operasi ini
-    const client2 = await pool.connect();
-    try {
+    if (newStatus === 'PAID') {
+      const client2 = await pool.connect();
+      try {
         await client2.query('BEGIN');
 
         // 1. Dapatkan data order dan customer
         const orderData = await client2.query(
-            `SELECT o.id, o.customer_id, o.ordered_at
-             FROM orders o
-             WHERE o.id = $1`,
-            [id]
+          `SELECT o.id, o.customer_id, o.ordered_at
+           FROM orders o
+           WHERE o.id = $1`,
+          [id]
         );
         const order = orderData.rows[0];
         if (!order) throw new Error('Order not found');
 
+        // Jika customer_id null, gunakan customer default "Walk-in"
+        let customerId = order.customer_id;
+        if (!customerId) {
+          const defaultCustomer = await client2.query(
+            `SELECT id FROM customers WHERE phone_number = '0000000000' LIMIT 1`
+          );
+          if (defaultCustomer.rows.length === 0) {
+            const newCustomer = await client2.query(
+              `INSERT INTO customers (id, name, phone_number, created_at, updated_at)
+               VALUES (uuid_generate_v4(), 'Walk-in', '0000000000', NOW(), NOW())
+               RETURNING id`
+            );
+            customerId = newCustomer.rows[0].id;
+          } else {
+            customerId = defaultCustomer.rows[0].id;
+          }
+        }
+
         // 2. Dapatkan order items & hitung total
         const itemsResult = await client2.query(
-            `SELECT product_id, quantity, subtotal
-             FROM order_items
-             WHERE order_id = $1`,
-            [id]
+          `SELECT product_id, quantity, subtotal
+           FROM order_items
+           WHERE order_id = $1`,
+          [id]
         );
         const subtotal = itemsResult.rows.reduce((sum, i) => sum + parseFloat(i.subtotal), 0);
-        // asumsi tax & discount 0 untuk sekarang, bisa dikembangkan
         const tax = 0;
         const discount = 0;
         const total = subtotal + tax - discount;
@@ -934,34 +949,33 @@ if (newStatus === 'PAID') {
 
         // 4. Insert transaction
         const insertTrx = await client2.query(
-            `INSERT INTO transactions
-             (order_id, customer_id, transaction_number,
-              subtotal, tax_amount, discount_amount, total_amount, status, transaction_date)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PAID', NOW())
-             RETURNING id`,
-            [id, order.customer_id, transactionNumber, subtotal, tax, discount, total]
+          `INSERT INTO transactions
+           (order_id, customer_id, transaction_number,
+            subtotal, tax_amount, discount_amount, total_amount, status, transaction_date)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'PAID', NOW())
+           RETURNING id`,
+          [id, customerId, transactionNumber, subtotal, tax, discount, total]
         );
         const transactionId = insertTrx.rows[0].id;
 
         // 5. Insert payment record
-        const paymentMethod = req.body.payment_method || 'UNKNOWN';
-        const paymentAmount = req.body.payment_amount || total;
+        const payMethod = payment_method || 'UNKNOWN';
+        const payAmount = payment_amount || total;
         await client2.query(
-            `INSERT INTO payments
-             (transaction_id, method, amount, status, paid_at)
-             VALUES ($1, $2, $3, 'SUCCESS', NOW())`,
-            [transactionId, paymentMethod, paymentAmount]
+          `INSERT INTO payments
+           (transaction_id, method, amount, status, paid_at)
+           VALUES ($1, $2, $3, 'SUCCESS', NOW())`,
+          [transactionId, payMethod, payAmount]
         );
 
         await client2.query('COMMIT');
-    } catch (err) {
+      } catch (err) {
         await client2.query('ROLLBACK');
-        throw err; // akan ditangkap catch utama
-    } finally {
+        throw err;
+      } finally {
         client2.release();
+      }
     }
-}
-// === SAMPAI SINI ===
     // ============================================================
 
     res.json({ success: true, message: 'Order status updated', data: result.rows[0] });
@@ -1083,10 +1097,6 @@ app.get('/api/v1/products/:id/stock-movements', requireAdmin, async (req, res) =
         res.status(500).json({ success: false, message: 'Failed to fetch stock movements', debug: error.message });
     }
 });
-
-// INTERNAL: Auto reduce stock when order status changes to PAID or COMPLETED
-// Hook into existing PATCH /orders/:id/status
-// We'll override/append logic there
 
 // =============================================
 // 14. REPORTS & ANALYTICS
@@ -1260,7 +1270,9 @@ app.get('/api/v1/reports/stock-status', requireAdmin, async (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, message: 'Failed to fetch stock status', debug: error.message });
     }
+});
 
+// GET payment report (from payments table)
 app.get('/api/v1/reports/payments', requireAdmin, async (req, res) => {
     try {
         const { start_date, end_date } = req.query;
@@ -1291,10 +1303,10 @@ app.get('/api/v1/reports/payments', requireAdmin, async (req, res) => {
         res.status(500).json({ success: false, message: 'Failed to fetch payment report', debug: error.message });
     }
 });
-});
 
-
-
+// =============================================
+// 15. JALANKAN SERVER
+// =============================================
 app.listen(PORT, async () => {
   try {
     const result = await pool.query('SELECT NOW() as time');
