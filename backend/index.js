@@ -1062,6 +1062,180 @@ app.get('/api/v1/products/:id/stock-movements', requireAdmin, async (req, res) =
 // Hook into existing PATCH /orders/:id/status
 // We'll override/append logic there
 
+// =============================================
+// 14. REPORTS & ANALYTICS
+// =============================================
+
+// Helper: validasi tanggal
+function isValidDate(dateString) {
+    const regex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!regex.test(dateString)) return false;
+    const date = new Date(dateString);
+    return date instanceof Date && !isNaN(date);
+}
+
+// GET sales report with date filter
+app.get('/api/v1/reports/sales', requireAdmin, async (req, res) => {
+    try {
+        const { start_date, end_date, interval = 'day' } = req.query;
+        
+        // Default: 7 hari terakhir
+        let start = start_date || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        let end = end_date || new Date().toISOString().split('T')[0];
+        
+        if (!isValidDate(start) || !isValidDate(end)) {
+            return res.status(400).json({ success: false, message: 'Invalid date format. Use YYYY-MM-DD' });
+        }
+        
+        if (start > end) {
+            return res.status(400).json({ success: false, message: 'start_date must be before or equal to end_date' });
+        }
+        
+        // Aggregasi per interval (day, month, year)
+        let dateTrunc;
+        switch (interval) {
+            case 'month': dateTrunc = 'month'; break;
+            case 'year': dateTrunc = 'year'; break;
+            default: dateTrunc = 'day';
+        }
+        
+        const query = `
+            SELECT 
+                DATE_TRUNC($1, o.ordered_at) as period,
+                COUNT(DISTINCT o.id) as total_orders,
+                COALESCE(SUM(oi.subtotal), 0) as total_revenue,
+                COALESCE(AVG(oi.subtotal), 0) as average_order_value,
+                COUNT(oi.id) as total_items_sold
+            FROM orders o
+            LEFT JOIN order_items oi ON o.id = oi.order_id
+            WHERE o.status IN ('PAID', 'COMPLETED')
+                AND o.ordered_at >= $2::date
+                AND o.ordered_at <= $3::date
+                AND o.deleted_at IS NULL
+            GROUP BY period
+            ORDER BY period ASC
+        `;
+        
+        const result = await pool.query(query, [dateTrunc, start, end]);
+        
+        // Hitung total keseluruhan
+        const summaryQuery = `
+            SELECT 
+                COUNT(DISTINCT o.id) as total_orders,
+                COALESCE(SUM(oi.subtotal), 0) as total_revenue,
+                COALESCE(AVG(oi.subtotal), 0) as average_order_value,
+                COUNT(oi.id) as total_items_sold
+            FROM orders o
+            LEFT JOIN order_items oi ON o.id = oi.order_id
+            WHERE o.status IN ('PAID', 'COMPLETED')
+                AND o.ordered_at >= $1::date
+                AND o.ordered_at <= $2::date
+                AND o.deleted_at IS NULL
+        `;
+        const summaryResult = await pool.query(summaryQuery, [start, end]);
+        
+        res.json({
+            success: true,
+            data: {
+                period: result.rows,
+                summary: summaryResult.rows[0],
+                filters: { start_date: start, end_date: end, interval }
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to generate sales report', debug: error.message });
+    }
+});
+
+// GET top products (by quantity or revenue)
+app.get('/api/v1/reports/top-products', requireAdmin, async (req, res) => {
+    try {
+        const { limit = 10, sort_by = 'quantity' } = req.query;
+        const validSort = ['quantity', 'revenue'];
+        if (!validSort.includes(sort_by)) {
+            return res.status(400).json({ success: false, message: 'sort_by must be "quantity" or "revenue"' });
+        }
+        
+        let orderBy;
+        let selectField;
+        if (sort_by === 'quantity') {
+            orderBy = 'total_quantity DESC';
+            selectField = 'SUM(oi.quantity) as total_quantity';
+        } else {
+            orderBy = 'total_revenue DESC';
+            selectField = 'COALESCE(SUM(oi.subtotal), 0) as total_revenue';
+        }
+        
+        const query = `
+            SELECT 
+                p.id,
+                p.name,
+                p.barcode,
+                p.price,
+                COUNT(DISTINCT o.id) as order_count,
+                ${selectField},
+                COALESCE(SUM(oi.subtotal), 0) as revenue
+            FROM products p
+            JOIN order_items oi ON p.id = oi.product_id
+            JOIN orders o ON oi.order_id = o.id
+            WHERE o.status IN ('PAID', 'COMPLETED')
+                AND o.deleted_at IS NULL
+            GROUP BY p.id, p.name, p.barcode, p.price
+            ORDER BY ${orderBy}
+            LIMIT $1
+        `;
+        
+        const result = await pool.query(query, [parseInt(limit)]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to fetch top products', debug: error.message });
+    }
+});
+
+// GET stock status (low stock & out of stock)
+app.get('/api/v1/reports/stock-status', requireAdmin, async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                id,
+                name,
+                barcode,
+                price,
+                stock,
+                min_stock,
+                CASE 
+                    WHEN stock <= 0 THEN 'OUT OF STOCK'
+                    WHEN stock <= min_stock THEN 'LOW STOCK'
+                    ELSE 'OK'
+                END as status
+            FROM products
+            WHERE deleted_at IS NULL
+                AND (stock <= min_stock OR stock <= 0)
+            ORDER BY stock ASC
+        `;
+        
+        const result = await pool.query(query);
+        
+        // Summary
+        const outOfStock = result.rows.filter(r => r.status === 'OUT OF STOCK').length;
+        const lowStock = result.rows.filter(r => r.status === 'LOW STOCK').length;
+        
+        res.json({
+            success: true,
+            data: {
+                products: result.rows,
+                summary: {
+                    total_products: result.rows.length,
+                    out_of_stock: outOfStock,
+                    low_stock: lowStock
+                }
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to fetch stock status', debug: error.message });
+    }
+});
+
 app.listen(PORT, async () => {
   try {
     const result = await pool.query('SELECT NOW() as time');
