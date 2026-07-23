@@ -894,48 +894,74 @@ app.patch('/api/v1/orders/:id/status', requireAuth, async (req, res) => {
     // ============================================================
     // 🆕 KODE BARU: LOGIKA STOK OTOMATIS (TAMBAHKAN DI SINI)
     // ============================================================
-    if (newStatus === 'PAID' || newStatus === 'COMPLETED') {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        
-        // Get order items
-        const itemsResult = await client.query(
-          'SELECT product_id, quantity FROM order_items WHERE order_id = $1',
-          [id]
+    // === TAMBAHKAN DI DALAM try setelah update status ===
+if (newStatus === 'PAID') {
+    // Buat client transaksi baru untuk operasi ini
+    const client2 = await pool.connect();
+    try {
+        await client2.query('BEGIN');
+
+        // 1. Dapatkan data order dan customer
+        const orderData = await client2.query(
+            `SELECT o.id, o.customer_id, o.ordered_at
+             FROM orders o
+             WHERE o.id = $1`,
+            [id]
         );
-        
-        for (const item of itemsResult.rows) {
-          // Reduce stock
-          const updateResult = await client.query(
-            'UPDATE products SET stock = stock - $1, updated_at = NOW() WHERE id = $2 AND stock >= $1 RETURNING id',
-            [item.quantity, item.product_id]
-          );
-          if (updateResult.rows.length === 0) {
-            throw new Error(`Insufficient stock for product ${item.product_id}`);
-          }
-          
-          // Record movement (fungsi helper sudah dibuat di Tahap 6)
-          await recordStockMovement(
-            item.product_id,
-            -item.quantity,           // negatif = stok keluar
-            'OUT',                    // type
-            id,                       // reference_id = order_id
-            'order',                  // reference_type
-            `Stock deducted from order ${orderNumber}`,
-            req.session.user.id,
-            client
-          );
-        }
-        
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err; // akan ditangkap oleh catch utama
-      } finally {
-        client.release();
-      }
+        const order = orderData.rows[0];
+        if (!order) throw new Error('Order not found');
+
+        // 2. Dapatkan order items & hitung total
+        const itemsResult = await client2.query(
+            `SELECT product_id, quantity, subtotal
+             FROM order_items
+             WHERE order_id = $1`,
+            [id]
+        );
+        const subtotal = itemsResult.rows.reduce((sum, i) => sum + parseFloat(i.subtotal), 0);
+        // asumsi tax & discount 0 untuk sekarang, bisa dikembangkan
+        const tax = 0;
+        const discount = 0;
+        const total = subtotal + tax - discount;
+
+        // 3. Generate transaction number
+        const now = new Date();
+        const dateStr = now.getFullYear().toString() +
+                        String(now.getMonth()+1).padStart(2,'0') +
+                        String(now.getDate()).padStart(2,'0');
+        const random = Math.floor(Math.random()*10000).toString().padStart(4,'0');
+        const transactionNumber = `TRX-${dateStr}-${random}`;
+
+        // 4. Insert transaction
+        const insertTrx = await client2.query(
+            `INSERT INTO transactions
+             (order_id, customer_id, transaction_number,
+              subtotal, tax_amount, discount_amount, total_amount, status, transaction_date)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PAID', NOW())
+             RETURNING id`,
+            [id, order.customer_id, transactionNumber, subtotal, tax, discount, total]
+        );
+        const transactionId = insertTrx.rows[0].id;
+
+        // 5. Insert payment record
+        const paymentMethod = req.body.payment_method || 'UNKNOWN';
+        const paymentAmount = req.body.payment_amount || total;
+        await client2.query(
+            `INSERT INTO payments
+             (transaction_id, method, amount, status, paid_at)
+             VALUES ($1, $2, $3, 'SUCCESS', NOW())`,
+            [transactionId, paymentMethod, paymentAmount]
+        );
+
+        await client2.query('COMMIT');
+    } catch (err) {
+        await client2.query('ROLLBACK');
+        throw err; // akan ditangkap catch utama
+    } finally {
+        client2.release();
     }
+}
+// === SAMPAI SINI ===
     // ============================================================
 
     res.json({ success: true, message: 'Order status updated', data: result.rows[0] });
@@ -1234,7 +1260,40 @@ app.get('/api/v1/reports/stock-status', requireAdmin, async (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, message: 'Failed to fetch stock status', debug: error.message });
     }
+
+app.get('/api/v1/reports/payments', requireAdmin, async (req, res) => {
+    try {
+        const { start_date, end_date } = req.query;
+        let query = `
+            SELECT 
+                p.method as payment_method,
+                COUNT(DISTINCT t.id) as total_transactions,
+                COALESCE(SUM(p.amount), 0) as total_sales
+            FROM payments p
+            JOIN transactions t ON p.transaction_id = t.id
+            WHERE t.status = 'PAID'
+        `;
+        const values = [];
+        let idx = 1;
+        if (start_date) {
+            query += ` AND p.paid_at >= $${idx++}`;
+            values.push(start_date);
+        }
+        if (end_date) {
+            query += ` AND p.paid_at <= $${idx++}`;
+            values.push(end_date);
+        }
+        query += ` GROUP BY p.method ORDER BY total_sales DESC`;
+
+        const result = await pool.query(query, values);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to fetch payment report', debug: error.message });
+    }
 });
+});
+
+
 
 app.listen(PORT, async () => {
   try {
