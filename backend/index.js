@@ -541,6 +541,382 @@ app.delete('/api/v1/products/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// =============================================
+// 11. CART MANAGEMENT (SESSION-BASED)
+// =============================================
+
+// Helper: get cart from session
+function getCart(req) {
+  if (!req.session.cart) {
+    req.session.cart = [];
+  }
+  return req.session.cart;
+}
+
+// GET cart contents
+app.get('/api/v1/cart', requireAuth, async (req, res) => {
+  try {
+    const cart = getCart(req);
+    if (cart.length === 0) {
+      return res.json({ success: true, data: [], total: 0 });
+    }
+
+    // Get product details for each cart item
+    const productIds = cart.map(item => item.product_id);
+    const result = await pool.query(
+      `SELECT id, name, barcode, price, image_url 
+       FROM products 
+       WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
+      [productIds]
+    );
+    const products = result.rows;
+
+    // Merge cart quantity with product info
+    const cartWithDetails = cart.map(item => {
+      const product = products.find(p => p.id === item.product_id);
+      if (!product) return null; // product deleted
+      return {
+        product_id: item.product_id,
+        quantity: item.quantity,
+        unit_price: item.unit_price || product.price,
+        subtotal: item.quantity * (item.unit_price || product.price),
+        product_name: product.name,
+        product_barcode: product.barcode,
+        product_image: product.image_url,
+      };
+    }).filter(item => item !== null);
+
+    const total = cartWithDetails.reduce((sum, item) => sum + item.subtotal, 0);
+    res.json({ success: true, data: cartWithDetails, total });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch cart', debug: error.message });
+  }
+});
+
+// POST add item to cart
+app.post('/api/v1/cart', requireAuth, async (req, res) => {
+  try {
+    const { product_id, quantity } = req.body;
+    if (!product_id || !quantity || quantity <= 0) {
+      return res.status(400).json({ success: false, message: 'product_id and positive quantity required' });
+    }
+
+    // Check product exists and get price
+    const productResult = await pool.query(
+      'SELECT id, price FROM products WHERE id = $1 AND deleted_at IS NULL AND is_available = true',
+      [product_id]
+    );
+    if (productResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product not available' });
+    }
+    const product = productResult.rows[0];
+
+    const cart = getCart(req);
+    const existingItem = cart.find(item => item.product_id === product_id);
+    if (existingItem) {
+      existingItem.quantity += quantity;
+      existingItem.unit_price = parseFloat(product.price);
+    } else {
+      cart.push({
+        product_id: product_id,
+        quantity: quantity,
+        unit_price: parseFloat(product.price),
+      });
+    }
+    req.session.cart = cart;
+    res.json({ success: true, message: 'Item added to cart' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to add to cart', debug: error.message });
+  }
+});
+
+// PATCH update item quantity in cart
+app.patch('/api/v1/cart/:product_id', requireAuth, async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const { quantity } = req.body;
+    if (quantity === undefined || quantity < 0) {
+      return res.status(400).json({ success: false, message: 'quantity must be >= 0' });
+    }
+
+    const cart = getCart(req);
+    const itemIndex = cart.findIndex(item => item.product_id === product_id);
+    if (itemIndex === -1) {
+      return res.status(404).json({ success: false, message: 'Item not in cart' });
+    }
+
+    if (quantity === 0) {
+      cart.splice(itemIndex, 1);
+    } else {
+      cart[itemIndex].quantity = quantity;
+    }
+    req.session.cart = cart;
+    res.json({ success: true, message: 'Cart updated' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to update cart', debug: error.message });
+  }
+});
+
+// DELETE remove item from cart
+app.delete('/api/v1/cart/:product_id', requireAuth, async (req, res) => {
+  try {
+    const { product_id } = req.params;
+    const cart = getCart(req);
+    const newCart = cart.filter(item => item.product_id !== product_id);
+    if (newCart.length === cart.length) {
+      return res.status(404).json({ success: false, message: 'Item not in cart' });
+    }
+    req.session.cart = newCart;
+    res.json({ success: true, message: 'Item removed from cart' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to remove item', debug: error.message });
+  }
+});
+
+// DELETE clear entire cart
+app.delete('/api/v1/cart', requireAuth, async (req, res) => {
+  req.session.cart = [];
+  res.json({ success: true, message: 'Cart cleared' });
+});
+
+// =============================================
+// 12. ORDER MANAGEMENT
+// =============================================
+
+// Helper: generate order number
+function generateOrderNumber() {
+  const now = new Date();
+  const dateStr = now.getFullYear().toString() +
+                  String(now.getMonth() + 1).padStart(2, '0') +
+                  String(now.getDate()).padStart(2, '0');
+  const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+  return `ORD-${dateStr}-${random}`;
+}
+
+// POST create order from cart
+app.post('/api/v1/orders', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { customer_id, table_id, notes } = req.body;
+    const cart = getCart(req);
+    if (cart.length === 0) {
+      return res.status(400).json({ success: false, message: 'Cart is empty' });
+    }
+
+    // Get product details and validate stock? (skip for now)
+    const productIds = cart.map(item => item.product_id);
+    const productResult = await pool.query(
+      'SELECT id, price FROM products WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL AND is_available = true',
+      [productIds]
+    );
+    if (productResult.rows.length !== cart.length) {
+      return res.status(400).json({ success: false, message: 'Some products are unavailable or deleted' });
+    }
+    const productMap = {};
+    productResult.rows.forEach(p => { productMap[p.id] = parseFloat(p.price); });
+
+    // Begin transaction
+    await client.query('BEGIN');
+
+    // Generate order number
+    const orderNumber = generateOrderNumber();
+
+    // Insert order
+    const orderResult = await client.query(
+      `INSERT INTO orders (order_number, customer_id, table_id, notes, session_id, status)
+       VALUES ($1, $2, $3, $4, $5, 'PENDING')
+       RETURNING id, order_number, status, ordered_at`,
+      [orderNumber, customer_id || null, table_id || null, notes || null, null]
+    );
+    const order = orderResult.rows[0];
+
+    // Insert order items
+    const orderItems = [];
+    for (const item of cart) {
+      const price = productMap[item.product_id];
+      const subtotal = item.quantity * price;
+      const itemResult = await client.query(
+        `INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, product_id, quantity, unit_price, subtotal`,
+        [order.id, item.product_id, item.quantity, price, subtotal]
+      );
+      orderItems.push(itemResult.rows[0]);
+    }
+
+    // Commit transaction
+    await client.query('COMMIT');
+
+    // Clear cart after successful order creation
+    req.session.cart = [];
+
+    res.status(201).json({
+      success: true,
+      message: 'Order created successfully',
+      data: {
+        order,
+        items: orderItems,
+        total: orderItems.reduce((sum, i) => sum + parseFloat(i.subtotal), 0),
+      },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Order creation error:', error);
+    res.status(500).json({ success: false, message: 'Failed to create order', debug: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// GET list orders with filters
+app.get('/api/v1/orders', requireAuth, async (req, res) => {
+  try {
+    const { status, start_date, end_date, limit = 50, offset = 0 } = req.query;
+    let query = `
+      SELECT o.id, o.order_number, o.status, o.ordered_at, o.completed_at,
+             o.customer_id, o.table_id, o.notes,
+             COUNT(oi.id) as item_count,
+             COALESCE(SUM(oi.subtotal), 0) as total_amount
+      FROM orders o
+      LEFT JOIN order_items oi ON o.id = oi.order_id
+      WHERE o.deleted_at IS NULL
+    `;
+    const conditions = [];
+    const values = [];
+    let idx = 1;
+
+    if (status) {
+      conditions.push(`o.status = $${idx++}`);
+      values.push(status.toUpperCase());
+    }
+    if (start_date) {
+      conditions.push(`o.ordered_at >= $${idx++}`);
+      values.push(start_date);
+    }
+    if (end_date) {
+      conditions.push(`o.ordered_at <= $${idx++}`);
+      values.push(end_date);
+    }
+
+    if (conditions.length > 0) {
+      query += ' AND ' + conditions.join(' AND ');
+    }
+
+    query += ` GROUP BY o.id ORDER BY o.ordered_at DESC LIMIT $${idx} OFFSET $${idx+1}`;
+    values.push(parseInt(limit), parseInt(offset));
+
+    const result = await pool.query(query, values);
+    res.json({ success: true, data: result.rows, pagination: { limit, offset } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch orders', debug: error.message });
+  }
+});
+
+// GET order detail by ID
+app.get('/api/v1/orders/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const orderResult = await pool.query(
+      `SELECT o.*, 
+              COUNT(oi.id) as item_count,
+              COALESCE(SUM(oi.subtotal), 0) as total_amount
+       FROM orders o
+       LEFT JOIN order_items oi ON o.id = oi.order_id
+       WHERE o.id = $1 AND o.deleted_at IS NULL
+       GROUP BY o.id`,
+      [id]
+    );
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    const order = orderResult.rows[0];
+
+    // Get items
+    const itemsResult = await pool.query(
+      `SELECT oi.*, p.name as product_name, p.barcode
+       FROM order_items oi
+       JOIN products p ON oi.product_id = p.id
+       WHERE oi.order_id = $1`,
+      [id]
+    );
+    order.items = itemsResult.rows;
+
+    res.json({ success: true, data: order });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch order', debug: error.message });
+  }
+});
+
+// PATCH update order status
+app.patch('/api/v1/orders/:id/status', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const allowedStatus = ['PENDING', 'PAID', 'COMPLETED', 'CANCELLED'];
+    if (!status || !allowedStatus.includes(status.toUpperCase())) {
+      return res.status(400).json({ success: false, message: 'Invalid status. Allowed: PENDING, PAID, COMPLETED, CANCELLED' });
+    }
+
+    const newStatus = status.toUpperCase();
+
+    // Check order exists and current status
+    const checkResult = await pool.query(
+      'SELECT id, status FROM orders WHERE id = $1 AND deleted_at IS NULL',
+      [id]
+    );
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    const currentStatus = checkResult.rows[0].status;
+
+    // Validation: cannot change if already CANCELLED or COMPLETED
+    if (['CANCELLED', 'COMPLETED'].includes(currentStatus) && currentStatus !== newStatus) {
+      return res.status(400).json({ success: false, message: `Cannot update a ${currentStatus} order` });
+    }
+
+    // If updating to COMPLETED, set completed_at
+    let completedAt = null;
+    if (newStatus === 'COMPLETED') {
+      completedAt = 'NOW()';
+    }
+
+    let query = `UPDATE orders SET status = $1, updated_at = NOW()`;
+    const values = [newStatus];
+    if (completedAt) {
+      query += `, completed_at = NOW()`;
+    }
+    query += ` WHERE id = $2 RETURNING id, status, order_number, completed_at`;
+    values.push(id);
+
+    const result = await pool.query(query, values);
+    res.json({ success: true, message: 'Order status updated', data: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to update order status', debug: error.message });
+  }
+});
+
+// DELETE order (only if PENDING)
+app.delete('/api/v1/orders/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const checkResult = await pool.query(
+      'SELECT id, status FROM orders WHERE id = $1 AND deleted_at IS NULL',
+      [id]
+    );
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+    if (checkResult.rows[0].status !== 'PENDING') {
+      return res.status(400).json({ success: false, message: 'Only PENDING orders can be deleted' });
+    }
+
+    // Soft delete order (cascade? We'll keep order_items but mark order deleted)
+    await pool.query('UPDATE orders SET deleted_at = NOW() WHERE id = $1', [id]);
+    res.json({ success: true, message: 'Order deleted' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to delete order', debug: error.message });
+  }
+});
 
 app.listen(PORT, async () => {
   try {
