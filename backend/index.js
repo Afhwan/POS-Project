@@ -861,13 +861,14 @@ app.patch('/api/v1/orders/:id/status', requireAuth, async (req, res) => {
 
     // Check order exists and current status
     const checkResult = await pool.query(
-      'SELECT id, status FROM orders WHERE id = $1 AND deleted_at IS NULL',
+      'SELECT id, status, order_number FROM orders WHERE id = $1 AND deleted_at IS NULL',
       [id]
     );
     if (checkResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
     const currentStatus = checkResult.rows[0].status;
+    const orderNumber = checkResult.rows[0].order_number;
 
     // Validation: cannot change if already CANCELLED or COMPLETED
     if (['CANCELLED', 'COMPLETED'].includes(currentStatus) && currentStatus !== newStatus) {
@@ -889,8 +890,57 @@ app.patch('/api/v1/orders/:id/status', requireAuth, async (req, res) => {
     values.push(id);
 
     const result = await pool.query(query, values);
+
+    // ============================================================
+    // 🆕 KODE BARU: LOGIKA STOK OTOMATIS (TAMBAHKAN DI SINI)
+    // ============================================================
+    if (newStatus === 'PAID' || newStatus === 'COMPLETED') {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        
+        // Get order items
+        const itemsResult = await client.query(
+          'SELECT product_id, quantity FROM order_items WHERE order_id = $1',
+          [id]
+        );
+        
+        for (const item of itemsResult.rows) {
+          // Reduce stock
+          const updateResult = await client.query(
+            'UPDATE products SET stock = stock - $1, updated_at = NOW() WHERE id = $2 AND stock >= $1 RETURNING id',
+            [item.quantity, item.product_id]
+          );
+          if (updateResult.rows.length === 0) {
+            throw new Error(`Insufficient stock for product ${item.product_id}`);
+          }
+          
+          // Record movement (fungsi helper sudah dibuat di Tahap 6)
+          await recordStockMovement(
+            item.product_id,
+            -item.quantity,           // negatif = stok keluar
+            'OUT',                    // type
+            id,                       // reference_id = order_id
+            'order',                  // reference_type
+            `Stock deducted from order ${orderNumber}`,
+            req.session.user.id,
+            client
+          );
+        }
+        
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err; // akan ditangkap oleh catch utama
+      } finally {
+        client.release();
+      }
+    }
+    // ============================================================
+
     res.json({ success: true, message: 'Order status updated', data: result.rows[0] });
   } catch (error) {
+    console.error('Order status update error:', error);
     res.status(500).json({ success: false, message: 'Failed to update order status', debug: error.message });
   }
 });
@@ -917,6 +967,100 @@ app.delete('/api/v1/orders/:id', requireAuth, async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to delete order', debug: error.message });
   }
 });
+
+// =============================================
+// 13. INVENTORY & STOCK MOVEMENT
+// =============================================
+
+// Helper: record stock movement
+async function recordStockMovement(productId, quantity, type, referenceId, referenceType, notes, userId, client) {
+    const query = `
+        INSERT INTO stock_movements (product_id, quantity, type, reference_id, reference_type, notes, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `;
+    await client.query(query, [productId, quantity, type, referenceId, referenceType, notes, userId]);
+}
+
+// PATCH update stock manually (admin only)
+app.patch('/api/v1/products/:id/stock', requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { id } = req.params;
+        const { quantity, notes } = req.body;
+        if (quantity === undefined) {
+            return res.status(400).json({ success: false, message: 'quantity is required' });
+        }
+
+        // Check product exists
+        const productCheck = await client.query(
+            'SELECT id, stock FROM products WHERE id = $1 AND deleted_at IS NULL',
+            [id]
+        );
+        if (productCheck.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'Product not found' });
+        }
+
+        const newStock = productCheck.rows[0].stock + quantity;
+        if (newStock < 0) {
+            return res.status(400).json({ success: false, message: 'Stock cannot be negative' });
+        }
+
+        await client.query('BEGIN');
+
+        // Update stock
+        await client.query(
+            'UPDATE products SET stock = $1, updated_at = NOW() WHERE id = $2',
+            [newStock, id]
+        );
+
+        // Record movement
+        const type = quantity >= 0 ? 'ADJUST' : 'ADJUST';
+        await recordStockMovement(
+            id,
+            quantity,
+            type,
+            null,
+            'manual',
+            notes || `Manual stock adjustment by ${req.session.user.username}`,
+            req.session.user.id,
+            client
+        );
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'Stock updated', data: { product_id: id, new_stock: newStock } });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ success: false, message: 'Failed to update stock', debug: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// GET stock movements for a product
+app.get('/api/v1/products/:id/stock-movements', requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { limit = 50, offset = 0 } = req.query;
+
+        const result = await pool.query(
+            `SELECT sm.*, u.username as created_by_username
+             FROM stock_movements sm
+             LEFT JOIN users u ON sm.created_by = u.id
+             WHERE sm.product_id = $1
+             ORDER BY sm.created_at DESC
+             LIMIT $2 OFFSET $3`,
+            [id, parseInt(limit), parseInt(offset)]
+        );
+
+        res.json({ success: true, data: result.rows, pagination: { limit, offset } });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to fetch stock movements', debug: error.message });
+    }
+});
+
+// INTERNAL: Auto reduce stock when order status changes to PAID or COMPLETED
+// Hook into existing PATCH /orders/:id/status
+// We'll override/append logic there
 
 app.listen(PORT, async () => {
   try {
